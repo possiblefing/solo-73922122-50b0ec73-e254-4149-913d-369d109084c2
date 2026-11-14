@@ -5,13 +5,16 @@ each serves the API and runs one cooperating worker.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 
+import asyncpg
 from fastapi import FastAPI, HTTPException, Query, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
 from . import config
@@ -22,6 +25,7 @@ from .models import (
     BatchResponse,
     CreditEventsImport,
     ImportAccepted,
+    RejectedResponse,
     ResultsPage,
     ResultRow,
 )
@@ -68,6 +72,25 @@ async def health() -> dict:
 # --------------------------------------------------------------------------- #
 # Imports
 # --------------------------------------------------------------------------- #
+# Concurrency contract (two API processes, one shared database):
+#
+#   * The primary key IS the arbiter. Version rows are written with a plain
+#     INSERT (never ON CONFLICT DO NOTHING), so a version that lost a
+#     concurrent race can never be silently swallowed while its batch is
+#     registered as accepted.
+#   * Canonical write order. Every importer inserts its rows ordered by the
+#     natural key, so overlapping batches acquire row/unique-index locks in
+#     the same global sequence and cannot deadlock -- even when two payloads
+#     list the same events in opposite order.
+#   * Rollback + re-check on collision. A unique violation aborts the whole
+#     attempt (no partial rows, no ledger entry), then the batch is re-checked
+#     against the freshly committed state: a differing stored version rejects
+#     the entire batch with 409; an identical one is an idempotent success.
+#   * Ledger == writes. "accepted" is recorded in the same transaction as the
+#     data rows; "rejected" is recorded in a transaction that writes no data
+#     rows; a rolled-back attempt leaves no ledger entry at all.
+#   * No global locks. Only the touched keys serialize (via the unique
+#     index), so imports of unrelated events never wait on each other.
 async def _record_import(conn, kind: str, row_count: int, ok: bool, reason: str | None) -> uuid.UUID:
     ingest_id = uuid.uuid4()
     await conn.execute(
@@ -79,81 +102,111 @@ async def _record_import(conn, kind: str, row_count: int, ok: bool, reason: str 
     return ingest_id
 
 
+def _reject_409(ingest_id: uuid.UUID, detail: str, conflicts: list[dict]) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content=jsonable_encoder(
+            {"detail": detail, "ingest_batch_id": ingest_id, "conflicts": conflicts}
+        ),
+    )
+
+
 @app.post(
     "/api/v1/imports/applications",
     response_model=ImportAccepted,
     status_code=status.HTTP_201_CREATED,
     tags=["imports"],
     summary="导入历史贷款申请（整批事务，失败全拒绝）",
+    responses={409: {"model": RejectedResponse, "description": "整批拒绝：负载内重复或申请已存在"}},
 )
 async def import_applications(payload: ApplicationsImport) -> ImportAccepted:
+    apps = payload.applications
+    # Duplicates inside the payload.
+    seen: set[str] = set()
+    dupes = sorted({a.application_id for a in apps
+                    if a.application_id in seen or seen.add(a.application_id)})
+
     pool = get_pool()
+    for _attempt in range(config.IMPORT_MAX_ATTEMPTS):
+        try:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    if dupes:
+                        ingest_id = await _record_import(
+                            conn, "applications", len(apps), False,
+                            f"duplicate application_id in payload: {dupes}",
+                        )
+                        return _reject_409(
+                            ingest_id,
+                            "whole import rejected: duplicate application_id in payload",
+                            [{"application_id": i, "reason": "duplicated in payload"}
+                             for i in dupes],
+                        )
+
+                    existing = await conn.fetch(
+                        """SELECT application_id, ingested_at, ingest_batch_id
+                             FROM applications WHERE application_id = ANY($1)""",
+                        [a.application_id for a in apps],
+                    )
+                    if existing:
+                        ids = [r["application_id"] for r in existing]
+                        ingest_id = await _record_import(
+                            conn, "applications", len(apps), False,
+                            f"application_id already imported: {ids}",
+                        )
+                        return _reject_409(
+                            ingest_id,
+                            "whole import rejected: application_id already exists",
+                            [{"application_id": r["application_id"],
+                              "reason": "application_id already imported",
+                              "ingest_batch_id": r["ingest_batch_id"],
+                              "ingested_at": r["ingested_at"]} for r in existing],
+                        )
+
+                    ingest_id = await _record_import(conn, "applications", len(apps), True, None)
+                    # Canonical write order (see the contract above).
+                    ordered = sorted(apps, key=lambda a: a.application_id)
+                    await conn.executemany(
+                        """INSERT INTO applications
+                               (application_id, customer_id, application_time,
+                                ingested_at, ingest_batch_id)
+                           VALUES ($1, $2, $3, now(), $4)""",
+                        [(a.application_id, a.customer_id, a.application_time, ingest_id)
+                         for a in ordered],
+                    )
+                    return ImportAccepted(
+                        ingest_batch_id=ingest_id, imported=len(apps), kind="applications"
+                    )
+        except (asyncpg.UniqueViolationError, asyncpg.DeadlockDetectedError):
+            # A concurrent import committed the same application_id between
+            # our check and our write. Everything rolled back; re-check.
+            continue
+
+    # Every attempt collided with a concurrent import: decide on a fresh
+    # snapshot without writing any data rows.
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # Duplicates inside the payload.
-            seen: set[str] = set()
-            dupes = [a.application_id for a in payload.applications
-                     if a.application_id in seen or seen.add(a.application_id)]
-            if dupes:
-                ingest_id = await _record_import(
-                    conn, "applications", len(payload.applications), False,
-                    f"duplicate application_id in payload: {sorted(set(dupes))}",
-                )
-                return JSONResponse(
-                    status_code=409,
-                    content={
-                        "detail": "whole import rejected: duplicate application_id in payload",
-                        "ingest_batch_id": str(ingest_id),
-                        "conflicts": sorted(set(dupes)),
-                    },
-                )
-
             existing = await conn.fetch(
                 "SELECT application_id FROM applications WHERE application_id = ANY($1)",
-                [a.application_id for a in payload.applications],
+                [a.application_id for a in apps],
             )
-            if existing:
-                ids = [r["application_id"] for r in existing]
-                ingest_id = await _record_import(
-                    conn, "applications", len(payload.applications), False,
-                    f"application_id already imported: {ids}",
-                )
-                return JSONResponse(
-                    status_code=409,
-                    content={
-                        "detail": "whole import rejected: application_id already exists",
-                        "ingest_batch_id": str(ingest_id),
-                        "conflicts": ids,
-                    },
-                )
-
-            ingest_id = await _record_import(conn, "applications", len(payload.applications), True, None)
-            await conn.executemany(
-                """INSERT INTO applications
-                       (application_id, customer_id, application_time,
-                        ingested_at, ingest_batch_id)
-                   VALUES ($1, $2, $3, now(), $4)""",
-                [
-                    (a.application_id, a.customer_id, a.application_time, ingest_id)
-                    for a in payload.applications
-                ],
-            )
-    return ImportAccepted(ingest_batch_id=ingest_id, imported=len(payload.applications), kind="applications")
+            ids = [r["application_id"] for r in existing]
+            detail = (f"whole import rejected: application_id already exists {ids}"
+                      if ids else
+                      "whole import rejected: concurrent import collision, please retry")
+            ingest_id = await _record_import(conn, "applications", len(apps), False, detail)
+            return _reject_409(ingest_id, detail,
+                               [{"application_id": i, "reason": "already imported"} for i in ids])
 
 
-@app.post(
-    "/api/v1/imports/credit-events",
-    response_model=ImportAccepted,
-    status_code=status.HTTP_201_CREATED,
-    tags=["imports"],
-    summary="导入征信变更日志（同事件同获知时间异值则整批拒绝）",
-)
-async def import_credit_events(payload: CreditEventsImport) -> ImportAccepted:
-    pool = get_pool()
-    events = payload.events
+def _validate_credit_payload(events) -> tuple[dict, dict, list[dict]]:
+    """Collapse identical duplicates; detect in-payload conflicts.
 
-    # ---- validation: identical duplicates collapse; differing versions on
-    # the same (event_id, known_time) reject the entire import batch. ----
+    Returns (versions, customer_of_event, conflicts): ``versions`` maps
+    (event_id, known_time) to the value signature, ``customer_of_event`` maps
+    event_id to its single customer_id, ``conflicts`` is non-empty when the
+    payload itself is inconsistent.
+    """
     versions: dict[tuple[str, datetime], dict] = {}
     conflicts: list[dict] = []
     customer_of_event: dict[str, str] = {}
@@ -166,93 +219,206 @@ async def import_credit_events(payload: CreditEventsImport) -> ImportAccepted:
             "withdrawn": e.withdrawn,
         }
         if key in versions and versions[key] != signature:
-            conflicts.append({"event_id": e.event_id, "known_time": e.known_time.isoformat(),
-                              "reason": "different values for same event_id+known_time"})
+            conflicts.append({
+                "event_id": e.event_id,
+                "known_time": e.known_time,
+                "reason": "different values for same event_id+known_time in payload",
+                "rejected": [versions[key], signature],
+            })
         else:
             versions.setdefault(key, signature)
         prior_customer = customer_of_event.get(e.event_id)
         if prior_customer and prior_customer != e.customer_id:
-            conflicts.append({"event_id": e.event_id,
-                              "reason": "event_id mapped to multiple customer_id values"})
+            conflicts.append({
+                "event_id": e.event_id,
+                "reason": "event_id mapped to multiple customer_id values in payload",
+                "rejected_customer_ids": sorted({prior_customer, e.customer_id}),
+            })
         customer_of_event.setdefault(e.event_id, e.customer_id)
+    return versions, customer_of_event, conflicts
 
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            if conflicts:
-                ingest_id = await _record_import(conn, "credit_events", len(events), False,
-                                                 "conflicting versions in payload")
-                return JSONResponse(
-                    status_code=409,
-                    content={"detail": "whole import rejected: conflicting event versions",
-                             "ingest_batch_id": str(ingest_id), "conflicts": conflicts},
-                )
 
-            # Cross-check against already-stored versions.
-            db_rows = await conn.fetch(
-                """SELECT event_id, known_time, customer_id, business_time,
-                          income, withdrawn
-                     FROM credit_event_versions
-                    WHERE (event_id, known_time) IN (
+async def _check_credit_events(conn, versions: dict, customer_of_event: dict
+                               ) -> tuple[list[dict], dict]:
+    """Diff payload versions against stored ones.
+
+    Returns (conflicts, to_insert): ``conflicts`` names every stored version
+    that disagrees with the payload (with the stored values and the batch
+    that wrote them); ``to_insert`` holds the genuinely new versions.
+    """
+    conflicts: list[dict] = []
+    to_insert: dict[tuple[str, datetime], dict] = {}
+    if versions:
+        db_rows = await conn.fetch(
+            """SELECT event_id, known_time, customer_id, business_time,
+                      income, withdrawn, ingested_at, ingest_batch_id
+                 FROM credit_event_versions
+                WHERE (event_id, known_time) IN (
                         SELECT v.e, v.k FROM unnest($1::text[], $2::timestamptz[])
                             AS v(e, k)
                     )""",
-                [k[0] for k in versions], [k[1] for k in versions],
-            )
-            for row in db_rows:
-                sig = versions[(row["event_id"], row["known_time"])]
-                if (sig["customer_id"] != row["customer_id"]
-                        or sig["business_time"] != row["business_time"]
-                        or sig["income"] != row["income"]
-                        or sig["withdrawn"] != row["withdrawn"]):
-                    conflicts.append({
-                        "event_id": row["event_id"],
-                        "known_time": row["known_time"].isoformat(),
-                        "reason": "different values already stored for event_id+known_time",
-                    })
-            if conflicts:
-                ingest_id = await _record_import(conn, "credit_events", len(events), False,
-                                                 "conflicts with stored versions")
-                return JSONResponse(
-                    status_code=409,
-                    content={"detail": "whole import rejected: conflicts with stored versions",
-                             "ingest_batch_id": str(ingest_id), "conflicts": conflicts},
-                )
+            [k[0] for k in versions], [k[1] for k in versions],
+        )
+        stored = {(r["event_id"], r["known_time"]): r for r in db_rows}
+    else:
+        stored = {}
 
-            # Customer consistency for events that already exist under other versions.
-            known_events = await conn.fetch(
-                "SELECT DISTINCT event_id, customer_id FROM credit_event_versions WHERE event_id = ANY($1)",
-                list(customer_of_event),
-            )
-            for row in known_events:
-                if customer_of_event.get(row["event_id"]) != row["customer_id"]:
-                    conflicts.append({"event_id": row["event_id"],
-                                      "reason": "event_id belongs to another customer_id"})
-            if conflicts:
-                ingest_id = await _record_import(conn, "credit_events", len(events), False,
-                                                 "event/customer mismatch")
-                return JSONResponse(
-                    status_code=409,
-                    content={"detail": "whole import rejected: event/customer mismatch",
-                             "ingest_batch_id": str(ingest_id), "conflicts": conflicts},
-                )
+    for key, sig in versions.items():
+        row = stored.get(key)
+        if row is None:
+            to_insert[key] = sig  # genuinely new version
+            continue
+        if (sig["customer_id"] != row["customer_id"]
+                or sig["business_time"] != row["business_time"]
+                or sig["income"] != row["income"]
+                or sig["withdrawn"] != row["withdrawn"]):
+            conflicts.append({
+                "event_id": key[0],
+                "known_time": key[1],
+                "reason": "different values already stored for event_id+known_time",
+                "stored": {
+                    "customer_id": row["customer_id"],
+                    "business_time": row["business_time"],
+                    "income": row["income"],
+                    "withdrawn": row["withdrawn"],
+                    "ingest_batch_id": row["ingest_batch_id"],
+                    "ingested_at": row["ingested_at"],
+                },
+                "rejected": sig,
+            })
+        # Identical version already stored: idempotent retransmission, skip.
 
-            ingest_id = await _record_import(conn, "credit_events", len(events), True, None)
-            inserted = 0
-            for (event_id, known_time), sig in versions.items():
-                # Skip exact duplicates already present (idempotent re-import).
-                tag = await conn.execute(
-                    """INSERT INTO credit_event_versions
-                           (event_id, customer_id, business_time, known_time,
-                            income, withdrawn, ingested_at, ingest_batch_id)
-                       VALUES ($1,$2,$3,$4,$5,$6,now(),$7)
-                       ON CONFLICT (event_id, known_time) DO NOTHING""",
-                    event_id, sig["customer_id"], sig["business_time"], known_time,
-                    sig["income"], sig["withdrawn"], ingest_id,
+    # Customer consistency for events that already exist under other versions.
+    if customer_of_event:
+        known_events = await conn.fetch(
+            """SELECT DISTINCT event_id, customer_id FROM credit_event_versions
+                WHERE event_id = ANY($1)""",
+            list(customer_of_event),
+        )
+        for row in known_events:
+            if customer_of_event.get(row["event_id"]) != row["customer_id"]:
+                conflicts.append({
+                    "event_id": row["event_id"],
+                    "reason": "event_id belongs to another customer_id",
+                    "stored_customer_id": row["customer_id"],
+                    "rejected_customer_id": customer_of_event[row["event_id"]],
+                })
+    return conflicts, to_insert
+
+
+@app.post(
+    "/api/v1/imports/credit-events",
+    response_model=ImportAccepted,
+    status_code=status.HTTP_201_CREATED,
+    tags=["imports"],
+    summary="导入征信变更日志（同事件同获知时间异值则整批拒绝）",
+    responses={409: {"model": RejectedResponse, "description": "整批拒绝：负载内冲突或与已存版本冲突"}},
+)
+async def import_credit_events(
+    payload: CreditEventsImport,
+    demo_check_delay_seconds: float = Query(
+        default=0.0, ge=0.0, le=30.0,
+        description="演示/测试钩子：冲突检查通过后、写入前等待 N 秒，"
+                    "放大并发交错窗口以复现竞态（生产保持 0）",
+    ),
+) -> ImportAccepted:
+    events = payload.events
+    versions, customer_of_event, payload_conflicts = _validate_credit_payload(events)
+
+    pool = get_pool()
+    for attempt in range(config.IMPORT_MAX_ATTEMPTS):
+        try:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    if payload_conflicts:
+                        ingest_id = await _record_import(
+                            conn, "credit_events", len(events), False,
+                            "conflicting versions in payload",
+                        )
+                        return _reject_409(
+                            ingest_id,
+                            "whole import rejected: conflicting event versions in payload",
+                            payload_conflicts,
+                        )
+
+                    conflicts, to_insert = await _check_credit_events(
+                        conn, versions, customer_of_event
+                    )
+                    if conflicts:
+                        ingest_id = await _record_import(
+                            conn, "credit_events", len(events), False,
+                            f"conflicts with stored versions ({len(conflicts)})",
+                        )
+                        return _reject_409(
+                            ingest_id,
+                            "whole import rejected: conflicts with stored versions",
+                            conflicts,
+                        )
+
+                    # Demo hook: hold the (still empty-of-writes) transaction
+                    # open after the check so a concurrent import can pass its
+                    # own check too -- reproducing the interleaved-writes race.
+                    if demo_check_delay_seconds and attempt == 0:
+                        await asyncio.sleep(demo_check_delay_seconds)
+
+                    ingest_id = await _record_import(conn, "credit_events", len(events), True, None)
+                    # Canonical write order: overlapping batches lock the same
+                    # keys in the same sequence (no deadlock), and the primary
+                    # key lets exactly one of them commit each version.
+                    for event_id, known_time in sorted(to_insert):
+                        sig = to_insert[(event_id, known_time)]
+                        await conn.execute(
+                            """INSERT INTO credit_event_versions
+                                   (event_id, customer_id, business_time, known_time,
+                                    income, withdrawn, ingested_at, ingest_batch_id)
+                               VALUES ($1,$2,$3,$4,$5,$6,now(),$7)""",
+                            event_id, sig["customer_id"], sig["business_time"], known_time,
+                            sig["income"], sig["withdrawn"], ingest_id,
+                        )
+                    return ImportAccepted(
+                        ingest_batch_id=ingest_id, imported=len(to_insert), kind="credit_events"
+                    )
+        except (asyncpg.UniqueViolationError, asyncpg.DeadlockDetectedError):
+            # A concurrent import committed a version we had just found
+            # absent. The whole attempt rolled back -- none of this batch's
+            # new rows and no ledger entry survived. Re-check against the
+            # fresh committed state and let the checks decide (409 on a real
+            # conflict, idempotent 201 on an identical retransmission).
+            continue
+
+    # All attempts collided with concurrent imports. Make the final decision
+    # on a fresh snapshot without writing any data rows.
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            conflicts, to_insert = await _check_credit_events(conn, versions, customer_of_event)
+            if conflicts:
+                ingest_id = await _record_import(
+                    conn, "credit_events", len(events), False,
+                    f"conflicts with stored versions ({len(conflicts)})",
                 )
-                if tag.endswith("0 1"):
-                    inserted += 1
-    return ImportAccepted(ingest_batch_id=ingest_id, imported=inserted, kind="credit_events")
+                return _reject_409(
+                    ingest_id,
+                    "whole import rejected: conflicts with stored versions",
+                    conflicts,
+                )
+            if not to_insert:
+                # Every version is already stored exactly as submitted: the
+                # concurrent twin committed them, so this is an idempotent
+                # retransmission.
+                ingest_id = await _record_import(
+                    conn, "credit_events", len(events), True,
+                    "idempotent retransmission; all versions already stored",
+                )
+                return ImportAccepted(ingest_batch_id=ingest_id, imported=0, kind="credit_events")
+            ingest_id = await _record_import(
+                conn, "credit_events", len(events), False,
+                "concurrent imports collided repeatedly; safe to retry",
+            )
+            return _reject_409(
+                ingest_id,
+                "whole import rejected: concurrent import collision, please retry",
+                [],
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -420,6 +586,18 @@ async def get_results(
 # --------------------------------------------------------------------------- #
 # Debug / inspection helpers (used by the demo script and /docs)
 # --------------------------------------------------------------------------- #
+@app.get("/api/v1/imports", tags=["inspect"],
+         summary="查看导入批次登记（受理/拒绝及原因，与实际写入一致）")
+async def list_imports() -> list[dict]:
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT ingest_batch_id, import_kind, row_count, status, reason, received_at
+                 FROM import_batches ORDER BY received_at""",
+        )
+    return [dict(r.items()) for r in rows]
+
+
 @app.get("/api/v1/applications", tags=["inspect"], summary="查看已导入申请")
 async def list_applications() -> list[dict]:
     pool = get_pool()

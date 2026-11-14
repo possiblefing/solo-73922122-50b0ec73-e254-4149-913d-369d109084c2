@@ -37,6 +37,28 @@ FastAPI + PostgreSQL，两个共库 API 进程协作，执行者崩溃后另一�
 
 ## 二、并发与续算（两个共库进程）
 
+### 并发导入：整批判定，只有一批成功
+
+两个 API 进程同时导入时，"先冲突检查、后写入"存在检查与写入之间的竞态窗口。
+本服务按以下契约保证整批语义（见 `app/main.py` 顶部注释）：
+
+- **主键即裁决者**：版本行用普通 `INSERT` 写入（不用 `ON CONFLICT DO NOTHING`），
+  竞争失败的版本不会被静默吞掉还登记成功。
+- **规范写入顺序**：每批按 `(event_id, known_time)` 排序后写入，所有导入以相同
+  全局顺序获取锁——即使两批负载按相反顺序重叠也不会死锁、不会 500。
+- **碰撞即回滚重查**：唯一键冲突使整批回滚（部分行、登记记录都不留），随后基于
+  最新已提交状态重新检查：已存版本值不同 → 整批 409 并指出冲突版本（已存值、
+  写入它的批次、被拒值）；值完全相同 → 幂等成功。
+- **登记 == 实际写入**：`accepted` 与数据行同事务提交；`rejected` 在不写任何
+  数据行的事务里登记；回滚的尝试不留登记。`GET /api/v1/imports` 可核对。
+- **无全局锁**：只有相碰的键经由唯一索引串行化，无关事件的导入互不等待。
+
+演示钩子：`POST /api/v1/imports/credit-events?demo_check_delay_seconds=N` 在冲突
+检查通过后、写入前等待 N 秒（0–30，默认 0），把竞态窗口放大到可复现——
+`scripts/race_demo.py` 与 /docs 均可用它演示"双方通过检查后交错写入"。
+
+### 批次计算：认领、租约与续算
+
 每个 uvicorn 进程既提供 HTTP API，又运行一个 worker 循环，全部协调状态在 PostgreSQL 中：
 
 - 批次/分块认领用 `SELECT ... FOR UPDATE SKIP LOCKED`，保证同一时刻只有一个执行者。
@@ -81,6 +103,17 @@ curl -X POST localhost:8001/api/v1/imports/credit-events \
 curl -i -X POST localhost:8001/api/v1/imports/credit-events \
   -H 'Content-Type: application/json' -d @data/conflict_events.json
 ```
+
+### 2b. 并发交错导入演示（两进程共库）
+
+```bash
+python3 scripts/race_demo.py        # 或指定两个 BASE_URL
+```
+
+脚本以 `demo_check_delay_seconds` 撑大"检查→写入"窗口，可控复现并断言：
+双方通过检查后交错写入也只有一批 201（另一批 409 指出冲突版本，其独有行
+均不落库）；反序重叠正常判定不死锁；一批等待时无关事件照常导入；同值重传
+幂等。最后用一小段时点/分页回归确认原功能不受影响。
 
 ### 3. 生成批次并观察两进程协作
 
@@ -134,6 +167,7 @@ bash scripts/restart_demo.sh          # Docker 环境：重启非执行者 + SIG
 |---|---|
 | `scripts/seed.py` | 导入 `data/` 下的虚构申请与事件 |
 | `scripts/demo.py` | 端到端演示（导入、拒绝、时点结果、迟到更正隔离、分页、409 闸门） |
+| `scripts/race_demo.py` | 并发导入可控演示（交错写入、反序重叠、无关事件不阻塞、幂等重传） |
 | `scripts/gen_bulk.py` | 经 API 生成大批量虚构数据 |
 | `scripts/restart_demo.sh` | Docker 下的重启/故障转移演示 |
 | `scripts/lease_failover_test.py` | 不依赖 Docker 的租约接管测试（以 SQL 令租约过期精确模拟 SIGKILL 后的状态） |
@@ -147,6 +181,7 @@ pip install -r requirements.txt
 DATABASE_URL=postgresql://... uvicorn app.main:app --port 8001 &
 DATABASE_URL=postgresql://... uvicorn app.main:app --port 8002 &
 python3 scripts/demo.py
+python3 scripts/race_demo.py
 DATABASE_URL=postgresql://... python3 scripts/test_pit_sql.py
 DATABASE_URL=postgresql://... python3 scripts/lease_failover_test.py \
     http://127.0.0.1:8001 http://127.0.0.1:8002 postgresql://... 40
@@ -157,11 +192,12 @@ DATABASE_URL=postgresql://... python3 scripts/lease_failover_test.py \
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/api/v1/imports/applications` | 整批事务导入申请，重复 ID 全拒绝 |
-| POST | `/api/v1/imports/credit-events` | 整批事务导入事件版本，同键异值全拒绝 |
+| POST | `/api/v1/imports/credit-events` | 整批事务导入事件版本，同键异值全拒绝；`?demo_check_delay_seconds=` 为并发演示钩子 |
 | POST | `/api/v1/batches` | 生成回填批次（固化受理时输入） |
 | GET | `/api/v1/batches` / `/api/v1/batches/{id}` | 批次状态 |
 | POST | `/api/v1/batches/{id}/resume` | FAILED 批次断点续算 |
 | GET | `/api/v1/batches/{id}/results?limit=&cursor=` | 完成后分页查询结果 |
+| GET | `/api/v1/imports` | 导入批次登记（accepted/rejected + 原因，与实际写入一致） |
 | GET | `/api/v1/applications` / `/api/v1/events` | 已导入数据检查 |
 | GET | `/health` | 进程与 worker 身份 |
 

@@ -1,7 +1,6 @@
 """Asyncpg connection pool and schema bootstrap."""
 from __future__ import annotations
 
-import asyncio
 import pathlib
 import re
 
